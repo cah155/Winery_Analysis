@@ -1,0 +1,234 @@
+---
+title: "winery analysis"
+author: "Connor Hunt"
+date: "October 1, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Winery Analysis
+
+###Loading libraries and importing data (dropping the row number column)
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(knitr)
+library(fitdistrplus)
+
+wine_data <- read.csv("winemag_data_pandata.csv", stringsAsFactors = FALSE) %>% dplyr::select(-X)
+
+```
+
+###ID three largest wineries
+```{r} 
+three_largest <- wine_data %>% 
+  group_by(winery) %>% 
+  summarise(n = n()) %>% 
+  arrange(desc(n)) %>% 
+  .[1:3,]
+```
+
+##Data Exploration
+
+```{r, echo=FALSE}
+
+thr_lrg <- three_largest$winery
+
+ggplot(data = wine_data %>% filter(winery %in% thr_lrg), aes(x = price)) +
+  geom_histogram(binwidth = 5) + 
+  facet_wrap(~ winery) + 
+  ggtitle("Count of Wine Prices for three largest wineries") + 
+  theme_light()
+
+```
+
+
+
+###Data cleanup
+
+It looks like we have some unclean data: negative values as well as missing values
+
+Negative prices seem to be a data entry error as these seem to be feasible prices for wine, just negatives
+
+```{r}
+ggplot(data = wine_data %>%
+         filter(price < 0),
+       aes(x = price)) + 
+  geom_histogram(binwidth = 1) +
+  theme_light()
+```
+
+#Clean up negatives
+```{r}
+clnr_wine <- wine_data %>% 
+  mutate(price = ifelse(price < 0, price * -1, price))
+```
+
+```{r}
+
+one_k_rev <- wine_data %>% 
+  group_by(country) %>% 
+  summarise(n = n()) %>% 
+  filter(n >= 1000) %>% 
+  pull(country)
+
+ggplot(data = clnr_wine %>% 
+         filter(country %in% one_k_rev),
+       aes(y = price, x = points)) +
+  geom_jitter(alpha = 0.5) + 
+  facet_wrap(~ country) + 
+  ggtitle("Wine price by review points",
+          "For countries with more than 1000 reviews") +
+  theme_light()
+```
+
+
+```{r}
+ggplot(data = clnr_wine %>% 
+         filter(country %in% one_k_rev,
+                price <= quantile(price, 0.999, na.rm = T)),
+       aes(y = price, x = points)) +
+  geom_jitter(alpha = 0.5) + 
+  facet_wrap(~ country) + 
+  ggtitle("Wine price by review points",
+          "For countries with more than 1000 reviews and price below the 99.9th percentile") +
+  theme_light()
+```
+
+
+
+###Check for other missing data
+```{r}
+lapply(clnr_wine,function(x){sum(is.na(x) | x == '')}) %>% as.data.frame() %>% kable
+```
+
+replace NA prices with median wine price for that winery.
+```{r}
+clnr_wine <- clnr_wine %>% 
+  group_by(winery) %>% 
+  mutate(price = ifelse(is.na(price), median(price, na.rm = T), price)) %>% 
+  ungroup()
+
+sum(is.na(clnr_wine$price))
+
+clnr_wine <- clnr_wine %>% filter(!is.na(price))
+```
+
+There were still 1688 wines with no price, which indicates that all wines at that winery were missing their price data. I've decided to remove these from the data set.
+
+##Modeling
+
+```{r}
+wine_train <- sample_frac(clnr_wine, size = 0.6667)
+
+wine_test <- setdiff(clnr_wine, wine_train)
+
+model <- lm(points ~ price, data = wine_train)
+
+log_model <- lm(points ~ log(price), data = wine_train)
+
+preds <- list(train = model$fitted.values,
+              test = predict(model, wine_test))
+
+log_preds <- list(train = log_model$fitted.values,
+              test = predict(log_model, wine_test))
+
+actuals <- list(train = wine_train$points, test = 
+                  wine_test$points)
+
+mod_results <- map2(.x = preds, .y = actuals, .f = ~caret::RMSE(.x, .y))
+
+log_results <- map2(.x = log_preds, .y = actuals, .f = ~caret::RMSE(.x, .y))
+
+results <- bind_rows(mod_results, log_results) %>% 
+  set_names(., paste0(names(.), '_RMSE')) %>% 
+  mutate(model_type = ifelse(train_RMSE == mod_results$train & test_RMSE == mod_results$test,
+                             "linear",
+                             "log")) %>% 
+  .[,c(3,1,2)]
+
+kable(results)
+
+```
+
+Based on RMSE I would say that the points ~ log(price) model is better. This was suggested by the skewed distribution of price evident in this histogram:
+
+```{r}
+
+ggplot(data = clnr_wine, aes(x = price)) +
+  geom_histogram(binwidth = 5)+ 
+  ggtitle("Histogram of wine price") + 
+  theme_light()
+```
+
+The choice of the log model is further supported by these plots. 
+The first examines the relationship between the model's predicted values and the absolute value of the residuals.
+The second examines the distribution of the model's residuals
+
+```{r}
+
+all_mod_results <- bind_rows(
+  bind_cols('preds' = model$fitted.values, 
+            'resids' = model$residuals,
+            'model' = rep('linear', nrow(wine_train))),
+  bind_cols('preds' = log_model$fitted.values, 
+            'resids' = log_model$residuals,
+            'model' = rep('log', nrow(wine_train)))
+)
+
+ggplot(data = all_mod_results,
+       aes(x = preds, y = abs(resids))) +
+  geom_jitter(alpha = 0.5) +
+  facet_wrap(~model, nrow = 2) + 
+  ggtitle("Absolute value of Residuals by predictions") + 
+  theme_light()
+```
+```{r}
+ggplot(data = all_mod_results,
+       aes(x = resids)) +
+  geom_histogram(binwidth = 1) +
+  facet_wrap(~model, nrow = 1, scales = 'free') +
+  ggtitle("Distribution of residuals") +
+  theme_light()
+```
+
+
+The linear model plot shows a clear relationship between the magnitude of the prediction and the magnitude of the residual while the log model residuals are fairly normally distributed around 0, this is also shown in the histogram plots, especially if the difference in axes between the linear and log plots is noted. 
+
+#Winery ranking
+
+A simple metric to track a wineries value could be based on the ratio of price to review points (a "value ratio") for the wine from that winery. 
+
+In practice we could find the distribution of these ratio for all wines, and then for each winery determine where it's portfolio of wines fits in this overall distribution. If the wines tend to appear on the larger side of the points to price ratio, that winery would be ranked higher, if wines were uniformly distributed or centered in the greater distribution of the "value ratio" then the winery could be in the middle of the rankings, and wineries with wines in the lower end of the distribution would be ranked poorly
+
+```{r}
+
+winery_ranks <- clnr_wine %>% 
+  mutate(value_ratio = log(points/price),
+         vr_perc = pnorm(value_ratio, mean(value_ratio), sd(value_ratio))) %>% 
+  group_by(winery) %>% 
+  summarise(mean_vr = mean(vr_perc),
+            med_vr = median(vr_perc)) %>% 
+  ungroup() %>% 
+  mutate(mean_vr = (mean_vr - min(mean_vr))/ (max(mean_vr)-min(mean_vr)),
+         med_vr = (med_vr - min(med_vr))/ (max(med_vr)-min(med_vr)),
+         score = (mean_vr + med_vr) / 2,
+         rank = row_number(score)) %>%  
+  arrange(desc(rank))
+
+```
+
+Top Ten wineries:
+
+```{r}
+winery_ranks[1:10,]
+```
+
+
+
